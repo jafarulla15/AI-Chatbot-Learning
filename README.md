@@ -36,6 +36,24 @@ Step 3. Prepare the project directory
         ├── backups/
         └── documents/
 
+/srv/llm/knowledge-base/
+│
+├── incoming/
+│   └── Upload PDFs here
+│
+├── processed/
+│   └── Successfully indexed documents
+│
+├── failed/
+│   └── Failed PDF processing
+│
+├── archive/
+│   └── Original PDF backups
+│
+└── scripts/
+    └── Ingestion scripts
+
+    
 We will use:
 - /opt/enterprise-chatbot for application code.
 - /srv/llm/models for downloaded LLM models.
@@ -47,10 +65,35 @@ We will use:
 Go to URL: cd /opt/enterprise-chatbot
 Activate env : source rag-env/bin/activate
 
-Qdrant Vector Database
+**4. Install Qdrant Vector Database**
 /opt/enterprise-chatbot/docker/qdrant/docker-compose.yml
 
-5. Install the embedding model
+**Docker File:**
+```
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: enterprise-qdrant
+
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:6333:6333"
+
+    volumes:
+      - /srv/llm/qdrant:/qdrant/storage
+
+    environment:
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
+
+    security_opt:
+      - no-new-privileges:true
+```
+
+
+
+
+**5. Install the embedding model**
 The embedding model is different from your Qwen3 LLM.
 - Qwen3 generates answers.
 - BGE-M3 converts documents and questions into vectors.
