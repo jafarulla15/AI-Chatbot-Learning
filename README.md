@@ -136,4 +136,34 @@ Now we will connect all three components:
 
 
 
+**9. Verify that your PDF documents are stored in Qdrant**
+```
+curl http://127.0.0.1:6333/collections/earn_knowledge \
+-H "api-key: YOUR_GENERATED_SECRET"
+```
+
+
+
+
+**10. Test document retrieval using a real question**
+
+
+
+
+
+
+
+
+**11. Connect retrieved knowledge with Qwen3**
+
+    
+
+
+
+
+
+
+
+
+
 
