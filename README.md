@@ -6,6 +6,23 @@
 ollama list
 ```
 
+Step 3. Prepare the project directory
+
+/
+├── opt/
+│   └── enterprise-chatbot/
+│       ├── backend/
+│       ├── frontend/
+│       ├── docker/
+│       └── scripts/
+│
+└── srv/
+    └── llm/
+        ├── models/
+        ├── logs/
+        ├── backups/
+        └── documents/
+        
 Go to URL: cd /opt/enterprise-chatbot
 Activate env : source rag-env/bin/activate
 
