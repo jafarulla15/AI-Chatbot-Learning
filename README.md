@@ -1,5 +1,18 @@
 # AI-Chatbot-Learning
 
+2. Technology selection
+We will use the following components.
+Component              ---	Technology
+LLM                    ---		Ollama + Qwen3
+PDF                    ---	 extraction	PyMuPDF
+OCR for scanned PDFs   ---		Tesseract
+Embedding model        ---		BGE-M3
+Vector database        ---		Qdrant
+Metadata / history     ---		SQL Server
+
+Why BGE-M3? It supports multilingual embeddings, including English and many other languages, making it a useful candidate for your English/Bangla project documents.
+
+
 
 **Get List of installed**
 ```
@@ -22,7 +35,15 @@ Step 3. Prepare the project directory
         ├── logs/
         ├── backups/
         └── documents/
-        
+
+We will use:
+- /opt/enterprise-chatbot for application code.
+- /srv/llm/models for downloaded LLM models.
+- /srv/llm/documents for documents used in future RAG implementation.
+- /srv/llm/backups for backups.
+
+
+
 Go to URL: cd /opt/enterprise-chatbot
 Activate env : source rag-env/bin/activate
 
