@@ -90,7 +90,9 @@ services:
       - no-new-privileges:true
 ```
 
-
+**Create .env and give content at below:**
+QDRANT_API_KEY=YOUR_GENERATED_SECRET
+**key creation command:** openssl rand -hex 32
 
 
 **5. Install the embedding model**
@@ -122,7 +124,7 @@ tesseract --list-langs
 **Generate embeddings and save in Qdrant**
 Chunk + Vector + Document ID + Page Number
 
-**Create the PDF ingestion script**
+**8. Create the PDF ingestion script**
 Now we will connect all three components:
 - PyMuPDF extracts PDF text.
 - Ollama generates embeddings.
