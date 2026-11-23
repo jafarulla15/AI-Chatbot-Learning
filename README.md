@@ -240,6 +240,33 @@ curl http://localhost:11434/api/chat \
 
 
 
+# SQL Server database to your local LLM (Ollama)
+
+**Step 1 – Connect Python to SQL Server**
+```
+pip install pyodbc requests python-dotenv sqlglot
+```
+Install Microsoft ODBC Driver 18 for SQL Server if it is not already installed.
+Create a .env file:
+
+```
+DB_SERVER=192.168.1.100
+DB_NAME=EARN_DB
+DB_USER=chatbot_readonly
+DB_PASSWORD=your_password
+
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=your-model-name
+```
+
+
+
+
+
+
+
+
+
 
 
 
