@@ -167,3 +167,55 @@ curl http://127.0.0.1:6333/collections/earn_knowledge \
 
 
 
+
+
+
+
+
+
+
+
+
+
+**Test Ollama independently of your RAG application:**
+This is important because we need to identify whether the delay comes from the model or your Python RAG pipeline.
+Run:
+```
+curl http://localhost:11434/api/chat \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "qwen3:8b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain an enterprise project management system in 5 sentences."
+    }
+  ],
+  "think": false,
+  "stream": false,
+  "keep_alive": "30m",
+  "options": {
+    "num_ctx": 2048,
+    "num_predict": 200,
+    "num_thread": 16
+  }
+}' | jq '{
+  answer: .message.content,
+  load_seconds: (.load_duration / 1000000000),
+  prompt_tokens: .prompt_eval_count,
+  output_tokens: .eval_count,
+  generation_seconds: (.eval_duration / 1000000000)
+}'
+```
+
+
+
+
+
+
+
+
+
+
+
+
