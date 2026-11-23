@@ -158,9 +158,17 @@ curl http://127.0.0.1:6333/collections/earn_knowledge \
 
     
 
+##Start RAG Answer:
+**Create the final RAG answer-generation script**
 
+cd /opt/enterprise-chatbot
+source rag-env/bin/activate
+nano rag_chat.py
 
+**Execute the chatbot**
 
+source /opt/enterprise-chatbot/rag-env/bin/activate
+python /opt/enterprise-chatbot/rag_chat.py
 
 
 
