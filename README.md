@@ -168,7 +168,23 @@ curl http://127.0.0.1:6333/collections/earn_knowledge \
 
 
 
+**Disable thinking mode if you're using Qwen3**
 
+```
+payload = {
+    "model": "qwen3:8b",
+    "messages": messages,
+    "think": False,
+    "stream": False,
+    "keep_alive": "30m",
+    "options": {
+        "temperature": 0.2,
+        "num_ctx": 4096,
+        "num_predict": 256,
+        "num_thread": 16
+    }
+}
+```
 
 
 
