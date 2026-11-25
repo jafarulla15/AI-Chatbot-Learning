@@ -259,6 +259,27 @@ OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=your-model-name
 ```
 
+First, connect to SQL Server:
+
+sqlcmd -S localhost -U sa -C -d Earn
+
+3. Install Python dependencies
+Activate your existing Python virtual environment and install
+
+pip install pyodbc requests python-dotenv sqlglot
+
+4. Configure database connection
+   nano /opt/enterprise-chatbot/.env
+
+   ```
+   OLLAMA_URL=http://127.0.0.1:11434
+
+SQL_SERVER=127.0.0.1
+SQL_PORT=1433
+SQL_DATABASE=Earn
+SQL_USERNAME=llm_reader
+SQL_PASSWORD=YourStrongPassword123!
+```
 
 
 
