@@ -282,6 +282,272 @@ SQL_PASSWORD=YourStrongPassword123!
 ```
 
 
+5. Test Python connection to SQL Server
+Create test_sql.py:
+
+```
+
+import os
+import pyodbc
+from dotenv import load_dotenv
+
+load_dotenv("/opt/enterprise-chatbot/.env")
+
+conn_str = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    f"SERVER={os.getenv('SQL_SERVER')},{os.getenv('SQL_PORT')};"
+    f"DATABASE={os.getenv('SQL_DATABASE')};"
+    f"UID={os.getenv('SQL_USERNAME')};"
+    f"PWD={os.getenv('SQL_PASSWORD')};"
+    "Encrypt=yes;"
+    "TrustServerCertificate=yes;"
+)
+
+conn = pyodbc.connect(conn_str)
+
+cursor = conn.cursor()
+
+cursor.execute("""
+    SELECT TOP 10 *
+    FROM [ben].[Neet]
+""")
+
+columns = [column[0] for column in cursor.description]
+
+for row in cursor.fetchall():
+    print(dict(zip(columns, row)))
+
+conn.close()
+
+```
+
+
+
+2. Create a dedicated Python project structure
+
+```
+enterprise-chatbot/
+│
+├── .env
+│
+├── database/
+│   ├── __init__.py
+│   ├── connection.py
+│   └── schema_retrieval.py
+│
+├── prompts/
+│   └── sql_prompt.py
+│
+├── scripts/
+│   └── inspect_schema.py
+│
+└── db_chat.py
+```
+
+Create database/schema_retrieval.py:
+
+```
+
+import json
+from database.connection import get_connection
+
+
+def get_database_schema(allowed_schemas=None):
+
+    if allowed_schemas is None:
+        allowed_schemas = ["ben"]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # --------------------------------------
+        # 1. RETRIEVE TABLES AND COLUMN DETAILS
+        # --------------------------------------
+
+        placeholders = ",".join("?" for _ in allowed_schemas)
+
+        column_query = f"""
+            SELECT
+                s.name AS schema_name,
+                o.name AS table_name,
+                o.type_desc AS object_type,
+                c.name AS column_name,
+                t.name AS data_type,
+                c.max_length,
+                c.precision,
+                c.scale,
+                c.is_nullable,
+                c.is_identity,
+                CASE
+                    WHEN pk.column_id IS NOT NULL THEN 1
+                    ELSE 0
+                END AS is_primary_key
+
+            FROM sys.objects o
+
+            INNER JOIN sys.schemas s
+                ON o.schema_id = s.schema_id
+
+            INNER JOIN sys.columns c
+                ON o.object_id = c.object_id
+
+            INNER JOIN sys.types t
+                ON c.user_type_id = t.user_type_id
+
+            LEFT JOIN (
+                SELECT
+                    ic.object_id,
+                    ic.column_id
+                FROM sys.indexes i
+                INNER JOIN sys.index_columns ic
+                    ON i.object_id = ic.object_id
+                    AND i.index_id = ic.index_id
+                WHERE i.is_primary_key = 1
+                  AND ic.key_ordinal > 0
+            ) pk
+                ON c.object_id = pk.object_id
+                AND c.column_id = pk.column_id
+
+            WHERE o.type IN ('U', 'V')
+              AND s.name IN ({placeholders})
+
+            ORDER BY
+                s.name,
+                o.name,
+                c.column_id;
+        """
+
+        cursor.execute(column_query, allowed_schemas)
+
+        schema = {}
+
+        for row in cursor.fetchall():
+
+            table_name = f"{row.schema_name}.{row.table_name}"
+
+            if table_name not in schema:
+                schema[table_name] = {
+                    "object_type": row.object_type,
+                    "columns": [],
+                    "foreign_keys": []
+                }
+
+            schema[table_name]["columns"].append({
+                "name": row.column_name,
+                "data_type": row.data_type,
+                "max_length": row.max_length,
+                "precision": row.precision,
+                "scale": row.scale,
+                "nullable": bool(row.is_nullable),
+                "identity": bool(row.is_identity),
+                "primary_key": bool(row.is_primary_key)
+            })
+
+        # --------------------------------------
+        # 2. RETRIEVE FOREIGN KEY RELATIONSHIPS
+        # --------------------------------------
+
+        fk_query = f"""
+            SELECT
+                ps.name AS parent_schema,
+                pt.name AS parent_table,
+                pc.name AS parent_column,
+
+                rs.name AS referenced_schema,
+                rt.name AS referenced_table,
+                rc.name AS referenced_column,
+
+                fk.name AS foreign_key_name
+
+            FROM sys.foreign_keys fk
+
+            INNER JOIN sys.foreign_key_columns fkc
+                ON fk.object_id = fkc.constraint_object_id
+
+            INNER JOIN sys.tables pt
+                ON fkc.parent_object_id = pt.object_id
+
+            INNER JOIN sys.schemas ps
+                ON pt.schema_id = ps.schema_id
+
+            INNER JOIN sys.columns pc
+                ON fkc.parent_object_id = pc.object_id
+                AND fkc.parent_column_id = pc.column_id
+
+            INNER JOIN sys.tables rt
+                ON fkc.referenced_object_id = rt.object_id
+
+            INNER JOIN sys.schemas rs
+                ON rt.schema_id = rs.schema_id
+
+            INNER JOIN sys.columns rc
+                ON fkc.referenced_object_id = rc.object_id
+                AND fkc.referenced_column_id = rc.column_id
+
+            WHERE ps.name IN ({placeholders})
+              AND rs.name IN ({placeholders})
+
+            ORDER BY pt.name, fk.name;
+        """
+
+        cursor.execute(
+            fk_query,
+            allowed_schemas + allowed_schemas
+        )
+
+        for row in cursor.fetchall():
+
+            parent = f"{row.parent_schema}.{row.parent_table}"
+
+            if parent not in schema:
+                continue
+
+            schema[parent]["foreign_keys"].append({
+                "constraint": row.foreign_key_name,
+                "column": row.parent_column,
+                "references": (
+                    f"{row.referenced_schema}."
+                    f"{row.referenced_table}."
+                    f"{row.referenced_column}"
+                )
+            })
+
+        return schema
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# --------------------------------------
+# 3. EXPORT SCHEMA AS JSON
+# --------------------------------------
+
+def save_schema_to_file(
+    output_file="/opt/enterprise-chatbot/schema.json"
+):
+
+    schema = get_database_schema()
+
+    with open(output_file, "w", encoding="utf-8") as file:
+
+        json.dump(
+            schema,
+            file,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print(f"Schema saved successfully: {output_file}")
+
+    return schema
+
+
+```
+
+
+
 
 
 
