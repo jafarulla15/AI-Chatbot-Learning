@@ -333,7 +333,7 @@ enterprise-chatbot/
 ├── database/
 │   ├── __init__.py
 │   ├── connection.py
-│   └── schema_retrieval.py
+│   └── export_database_schema.py
 │
 ├── prompts/
 │   └── sql_prompt.py
@@ -344,207 +344,1066 @@ enterprise-chatbot/
 └── db_chat.py
 ```
 
-Create database/schema_retrieval.py:
+Create /opt/enterprise-chatbot/database/export_database_schema.py:
 
 ```
 
+
+import os
 import json
-from database.connection import get_connection
+import pyodbc
+
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 
 
-def get_database_schema(allowed_schemas=None):
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-    if allowed_schemas is None:
-        allowed_schemas = ["ben"]
+ENV_FILE = "/opt/enterprise-chatbot/.env"
 
-    conn = get_connection()
-    cursor = conn.cursor()
+OUTPUT_FILE = "/opt/enterprise-chatbot/earn_database_schema.json"
+
+load_dotenv(ENV_FILE)
+
+SQL_SERVER = os.getenv("SQL_SERVER", "127.0.0.1")
+SQL_PORT = os.getenv("SQL_PORT", "1433")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "Earn")
+SQL_USERNAME = os.getenv("SQL_USERNAME")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD")
+
+ODBC_DRIVER = os.getenv(
+    "ODBC_DRIVER",
+    "ODBC Driver 18 for SQL Server"
+)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_connection():
+
+    if not SQL_USERNAME or not SQL_PASSWORD:
+        raise ValueError(
+            "SQL_USERNAME or SQL_PASSWORD missing in .env"
+        )
+
+    connection_string = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={SQL_SERVER},{SQL_PORT};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
+        "Connection Timeout=30;"
+    )
+
+    return pyodbc.connect(connection_string)
+
+
+# ============================================================
+# GENERIC QUERY EXECUTION
+# ============================================================
+
+def fetch_all(cursor, query, params=None):
+
+    cursor.execute(query, params or [])
+
+    columns = [
+        column[0]
+        for column in cursor.description
+    ]
+
+    rows = cursor.fetchall()
+
+    return [
+        dict(zip(columns, row))
+        for row in rows
+    ]
+
+
+def fetch_one(cursor, query, params=None):
+
+    cursor.execute(query, params or [])
+
+    row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    columns = [
+        column[0]
+        for column in cursor.description
+    ]
+
+    return dict(zip(columns, row))
+
+
+# ============================================================
+# DATABASE INFORMATION
+# ============================================================
+
+def get_database_info(cursor):
+
+    query = """
+        SELECT
+            DB_NAME() AS database_name,
+            CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(256))
+                AS server_name,
+            CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(100))
+                AS sql_server_version,
+            CAST(SERVERPROPERTY('Edition') AS NVARCHAR(256))
+                AS sql_server_edition,
+            compatibility_level,
+            collation_name,
+            create_date
+        FROM sys.databases
+        WHERE name = DB_NAME();
+    """
+
+    return fetch_one(cursor, query)
+
+
+# ============================================================
+# SCHEMAS
+# ============================================================
+
+def get_schemas(cursor):
+
+    query = """
+        SELECT
+            schema_id,
+            name AS schema_name
+        FROM sys.schemas
+        WHERE name NOT IN (
+            'sys',
+            'INFORMATION_SCHEMA'
+        )
+        ORDER BY name;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# TABLES AND VIEWS
+# ============================================================
+
+def get_tables_and_views(cursor):
+
+    query = """
+        SELECT
+            s.name AS schema_name,
+            o.name AS object_name,
+            o.object_id,
+            o.type AS object_type,
+            o.type_desc AS object_type_desc,
+
+            CAST(ep.value AS NVARCHAR(MAX))
+                AS description,
+
+            CASE
+                WHEN o.type = 'V'
+                THEN OBJECT_DEFINITION(o.object_id)
+                ELSE NULL
+            END AS view_definition,
+
+            CAST(NULL AS BIGINT)
+                AS estimated_row_count
+
+        FROM sys.objects o
+
+        INNER JOIN sys.schemas s
+            ON o.schema_id = s.schema_id
+
+        LEFT JOIN sys.extended_properties ep
+            ON ep.class = 1
+            AND ep.major_id = o.object_id
+            AND ep.minor_id = 0
+            AND ep.name = 'MS_Description'
+
+        WHERE
+            o.type IN ('U', 'V')
+            AND o.is_ms_shipped = 0
+
+        ORDER BY
+            s.name,
+            o.name;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# COLUMNS
+# ============================================================
+
+def get_columns(cursor):
+
+    query = """
+        SELECT
+            s.name AS schema_name,
+            o.name AS object_name,
+            o.object_id,
+
+            c.column_id,
+            c.name AS column_name,
+
+            ts.name AS type_schema,
+            t.name AS data_type,
+
+            c.max_length,
+            c.precision,
+            c.scale,
+
+            c.is_nullable,
+            c.is_identity,
+            c.is_computed,
+
+            dc.definition AS default_definition,
+            cc.definition AS computed_definition,
+
+            c.collation_name,
+
+            CAST(ep.value AS NVARCHAR(MAX))
+                AS description
+
+        FROM sys.columns c
+
+        INNER JOIN sys.objects o
+            ON c.object_id = o.object_id
+
+        INNER JOIN sys.schemas s
+            ON o.schema_id = s.schema_id
+
+        INNER JOIN sys.types t
+            ON c.user_type_id = t.user_type_id
+
+        INNER JOIN sys.schemas ts
+            ON t.schema_id = ts.schema_id
+
+        LEFT JOIN sys.default_constraints dc
+            ON c.default_object_id = dc.object_id
+
+        LEFT JOIN sys.computed_columns cc
+            ON c.object_id = cc.object_id
+            AND c.column_id = cc.column_id
+
+        LEFT JOIN sys.extended_properties ep
+            ON ep.class = 1
+            AND ep.major_id = c.object_id
+            AND ep.minor_id = c.column_id
+            AND ep.name = 'MS_Description'
+
+        WHERE
+            o.type IN ('U', 'V')
+            AND o.is_ms_shipped = 0
+
+        ORDER BY
+            s.name,
+            o.name,
+            c.column_id;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# INDEXES AND PRIMARY KEYS
+# ============================================================
+
+def get_indexes(cursor):
+
+    query = """
+        SELECT
+            s.name AS schema_name,
+            o.name AS object_name,
+            o.object_id,
+
+            i.name AS index_name,
+            i.index_id,
+            i.type_desc AS index_type,
+
+            i.is_primary_key,
+            i.is_unique,
+            i.is_unique_constraint,
+            i.is_disabled,
+
+            ic.key_ordinal,
+            ic.is_included_column,
+            ic.is_descending_key,
+
+            c.name AS column_name
+
+        FROM sys.indexes i
+
+        INNER JOIN sys.objects o
+            ON i.object_id = o.object_id
+
+        INNER JOIN sys.schemas s
+            ON o.schema_id = s.schema_id
+
+        LEFT JOIN sys.index_columns ic
+            ON i.object_id = ic.object_id
+            AND i.index_id = ic.index_id
+
+        LEFT JOIN sys.columns c
+            ON ic.object_id = c.object_id
+            AND ic.column_id = c.column_id
+
+        WHERE
+            o.type IN ('U', 'V')
+            AND o.is_ms_shipped = 0
+            AND i.index_id > 0
+            AND i.is_hypothetical = 0
+
+        ORDER BY
+            s.name,
+            o.name,
+            i.index_id,
+            ic.key_ordinal,
+            ic.index_column_id;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# FOREIGN KEYS
+# ============================================================
+
+def get_foreign_keys(cursor):
+
+    query = """
+        SELECT
+
+            fk.object_id AS foreign_key_id,
+            fk.name AS foreign_key_name,
+
+            fk.parent_object_id,
+            fk.referenced_object_id,
+
+            ps.name AS schema_name,
+            pt.name AS table_name,
+
+            pc.name AS column_name,
+
+            rs.name AS referenced_schema_name,
+            rt.name AS referenced_table_name,
+
+            rc.name AS referenced_column_name,
+
+            fkc.constraint_column_id,
+
+            fk.delete_referential_action_desc
+                AS on_delete,
+
+            fk.update_referential_action_desc
+                AS on_update,
+
+            fk.is_disabled,
+            fk.is_not_trusted
+
+        FROM sys.foreign_keys fk
+
+        INNER JOIN sys.foreign_key_columns fkc
+            ON fk.object_id = fkc.constraint_object_id
+
+        INNER JOIN sys.tables pt
+            ON fkc.parent_object_id = pt.object_id
+
+        INNER JOIN sys.schemas ps
+            ON pt.schema_id = ps.schema_id
+
+        INNER JOIN sys.columns pc
+            ON fkc.parent_object_id = pc.object_id
+            AND fkc.parent_column_id = pc.column_id
+
+        INNER JOIN sys.tables rt
+            ON fkc.referenced_object_id = rt.object_id
+
+        INNER JOIN sys.schemas rs
+            ON rt.schema_id = rs.schema_id
+
+        INNER JOIN sys.columns rc
+            ON fkc.referenced_object_id = rc.object_id
+            AND fkc.referenced_column_id = rc.column_id
+
+        WHERE
+            pt.is_ms_shipped = 0
+
+        ORDER BY
+            ps.name,
+            pt.name,
+            fk.name,
+            fkc.constraint_column_id;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# CHECK CONSTRAINTS
+# ============================================================
+
+def get_check_constraints(cursor):
+
+    query = """
+        SELECT
+
+            s.name AS schema_name,
+            t.name AS table_name,
+
+            cc.name AS constraint_name,
+            cc.definition,
+
+            cc.is_disabled,
+            cc.is_not_trusted
+
+        FROM sys.check_constraints cc
+
+        INNER JOIN sys.tables t
+            ON cc.parent_object_id = t.object_id
+
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+
+        WHERE
+            t.is_ms_shipped = 0
+
+        ORDER BY
+            s.name,
+            t.name,
+            cc.name;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# DEFAULT CONSTRAINTS
+# ============================================================
+
+def get_default_constraints(cursor):
+
+    query = """
+        SELECT
+
+            s.name AS schema_name,
+            t.name AS table_name,
+
+            c.name AS column_name,
+
+            dc.name AS constraint_name,
+            dc.definition
+
+        FROM sys.default_constraints dc
+
+        INNER JOIN sys.tables t
+            ON dc.parent_object_id = t.object_id
+
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+
+        INNER JOIN sys.columns c
+            ON dc.parent_object_id = c.object_id
+            AND dc.parent_column_id = c.column_id
+
+        WHERE
+            t.is_ms_shipped = 0
+
+        ORDER BY
+            s.name,
+            t.name,
+            c.column_id;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# TABLE TRIGGERS
+# ============================================================
+
+def get_triggers(cursor):
+
+    query = """
+        SELECT
+
+            s.name AS schema_name,
+            t.name AS table_name,
+
+            tr.name AS trigger_name,
+
+            tr.is_disabled,
+            tr.is_instead_of_trigger,
+
+            OBJECT_DEFINITION(tr.object_id)
+                AS trigger_definition
+
+        FROM sys.triggers tr
+
+        INNER JOIN sys.tables t
+            ON tr.parent_id = t.object_id
+
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+
+        WHERE
+            tr.parent_class = 1
+            AND tr.is_ms_shipped = 0
+
+        ORDER BY
+            s.name,
+            t.name,
+            tr.name;
+    """
+
+    return fetch_all(cursor, query)
+
+
+# ============================================================
+# ORGANIZE COLUMNS
+# ============================================================
+
+def organize_columns(columns):
+
+    result = {}
+
+    for col in columns:
+
+        object_id = col["object_id"]
+
+        item = {
+            "column_id": col["column_id"],
+            "column_name": col["column_name"],
+            "data_type": col["data_type"],
+            "type_schema": col["type_schema"],
+            "max_length": col["max_length"],
+            "precision": col["precision"],
+            "scale": col["scale"],
+            "is_nullable": bool(col["is_nullable"]),
+            "is_identity": bool(col["is_identity"]),
+            "is_computed": bool(col["is_computed"]),
+            "default_definition": col["default_definition"],
+            "computed_definition": col["computed_definition"],
+            "collation_name": col["collation_name"],
+            "description": col["description"]
+        }
+
+        result.setdefault(object_id, []).append(item)
+
+    return result
+
+
+# ============================================================
+# ORGANIZE INDEXES
+# ============================================================
+
+def organize_indexes(indexes):
+
+    result = {}
+
+    for idx in indexes:
+
+        object_id = idx["object_id"]
+        index_id = idx["index_id"]
+
+        if object_id not in result:
+            result[object_id] = {}
+
+        if index_id not in result[object_id]:
+
+            result[object_id][index_id] = {
+                "index_name": idx["index_name"],
+                "index_type": idx["index_type"],
+                "is_primary_key": bool(idx["is_primary_key"]),
+                "is_unique": bool(idx["is_unique"]),
+                "is_unique_constraint": bool(
+                    idx["is_unique_constraint"]
+                ),
+                "is_disabled": bool(idx["is_disabled"]),
+                "key_columns": [],
+                "included_columns": []
+            }
+
+        if idx["column_name"]:
+
+            column_info = {
+                "column_name": idx["column_name"],
+                "is_descending": bool(
+                    idx["is_descending_key"]
+                )
+            }
+
+            if idx["is_included_column"]:
+                result[object_id][index_id][
+                    "included_columns"
+                ].append(column_info)
+
+            else:
+                result[object_id][index_id][
+                    "key_columns"
+                ].append(column_info)
+
+    final_result = {}
+
+    for object_id, indexes_by_id in result.items():
+
+        final_result[object_id] = []
+
+        for index in indexes_by_id.values():
+            final_result[object_id].append(index)
+
+    return final_result
+
+
+# ============================================================
+# ORGANIZE FOREIGN KEYS
+# ============================================================
+
+def organize_foreign_keys(foreign_keys):
+
+    result = {}
+
+    for fk in foreign_keys:
+
+        fk_id = fk["foreign_key_id"]
+
+        if fk_id not in result:
+
+            result[fk_id] = {
+                "foreign_key_name": fk["foreign_key_name"],
+                "schema_name": fk["schema_name"],
+                "table_name": fk["table_name"],
+
+                "referenced_schema_name":
+                    fk["referenced_schema_name"],
+
+                "referenced_table_name":
+                    fk["referenced_table_name"],
+
+                "on_delete": fk["on_delete"],
+                "on_update": fk["on_update"],
+
+                "is_disabled": bool(fk["is_disabled"]),
+                "is_not_trusted": bool(fk["is_not_trusted"]),
+
+                "column_mappings": []
+            }
+
+        result[fk_id]["column_mappings"].append({
+
+            "column_order": fk["constraint_column_id"],
+
+            "column_name": fk["column_name"],
+
+            "referenced_column_name":
+                fk["referenced_column_name"]
+
+        })
+
+    return list(result.values())
+
+
+# ============================================================
+# ORGANIZE CHECK CONSTRAINTS
+# ============================================================
+
+def organize_checks(checks):
+
+    result = {}
+
+    for item in checks:
+
+        key = (
+            item["schema_name"],
+            item["table_name"]
+        )
+
+        result.setdefault(key, []).append({
+
+            "constraint_name": item["constraint_name"],
+            "definition": item["definition"],
+            "is_disabled": bool(item["is_disabled"]),
+            "is_not_trusted": bool(item["is_not_trusted"])
+
+        })
+
+    return result
+
+
+# ============================================================
+# ORGANIZE DEFAULT CONSTRAINTS
+# ============================================================
+
+def organize_defaults(defaults):
+
+    result = {}
+
+    for item in defaults:
+
+        key = (
+            item["schema_name"],
+            item["table_name"]
+        )
+
+        result.setdefault(key, []).append({
+
+            "column_name": item["column_name"],
+            "constraint_name": item["constraint_name"],
+            "definition": item["definition"]
+
+        })
+
+    return result
+
+
+# ============================================================
+# ORGANIZE TRIGGERS
+# ============================================================
+
+def organize_triggers(triggers):
+
+    result = {}
+
+    for item in triggers:
+
+        key = (
+            item["schema_name"],
+            item["table_name"]
+        )
+
+        result.setdefault(key, []).append({
+
+            "trigger_name": item["trigger_name"],
+            "is_disabled": bool(item["is_disabled"]),
+
+            "is_instead_of_trigger": bool(
+                item["is_instead_of_trigger"]
+            ),
+
+            "trigger_definition": item["trigger_definition"]
+
+        })
+
+    return result
+
+
+# ============================================================
+# MAIN EXPORT FUNCTION
+# ============================================================
+
+def export_database_schema():
+
+    connection = None
 
     try:
-        # --------------------------------------
-        # 1. RETRIEVE TABLES AND COLUMN DETAILS
-        # --------------------------------------
 
-        placeholders = ",".join("?" for _ in allowed_schemas)
+        print("Connecting to SQL Server...")
 
-        column_query = f"""
-            SELECT
-                s.name AS schema_name,
-                o.name AS table_name,
-                o.type_desc AS object_type,
-                c.name AS column_name,
-                t.name AS data_type,
-                c.max_length,
-                c.precision,
-                c.scale,
-                c.is_nullable,
-                c.is_identity,
-                CASE
-                    WHEN pk.column_id IS NOT NULL THEN 1
-                    ELSE 0
-                END AS is_primary_key
+        connection = get_connection()
 
-            FROM sys.objects o
+        cursor = connection.cursor()
 
-            INNER JOIN sys.schemas s
-                ON o.schema_id = s.schema_id
+        print("Reading database information...")
+        database_info = get_database_info(cursor)
 
-            INNER JOIN sys.columns c
-                ON o.object_id = c.object_id
+        print("Reading schemas...")
+        schemas = get_schemas(cursor)
 
-            INNER JOIN sys.types t
-                ON c.user_type_id = t.user_type_id
+        print("Reading tables and views...")
+        objects = get_tables_and_views(cursor)
 
-            LEFT JOIN (
-                SELECT
-                    ic.object_id,
-                    ic.column_id
-                FROM sys.indexes i
-                INNER JOIN sys.index_columns ic
-                    ON i.object_id = ic.object_id
-                    AND i.index_id = ic.index_id
-                WHERE i.is_primary_key = 1
-                  AND ic.key_ordinal > 0
-            ) pk
-                ON c.object_id = pk.object_id
-                AND c.column_id = pk.column_id
+        print("Reading columns...")
+        columns = get_columns(cursor)
 
-            WHERE o.type IN ('U', 'V')
-              AND s.name IN ({placeholders})
+        print("Reading indexes and primary keys...")
+        indexes = get_indexes(cursor)
 
-            ORDER BY
-                s.name,
-                o.name,
-                c.column_id;
-        """
+        print("Reading foreign keys...")
+        foreign_keys = get_foreign_keys(cursor)
 
-        cursor.execute(column_query, allowed_schemas)
+        print("Reading check constraints...")
+        checks = get_check_constraints(cursor)
 
-        schema = {}
+        print("Reading default constraints...")
+        defaults = get_default_constraints(cursor)
 
-        for row in cursor.fetchall():
+        print("Reading triggers...")
+        triggers = get_triggers(cursor)
 
-            table_name = f"{row.schema_name}.{row.table_name}"
+        # ---------------------------------------------
+        # Organize metadata
+        # ---------------------------------------------
 
-            if table_name not in schema:
-                schema[table_name] = {
-                    "object_type": row.object_type,
-                    "columns": [],
-                    "foreign_keys": []
+        columns_map = organize_columns(columns)
+
+        indexes_map = organize_indexes(indexes)
+
+        foreign_keys_list = organize_foreign_keys(
+            foreign_keys
+        )
+
+        checks_map = organize_checks(checks)
+
+        defaults_map = organize_defaults(defaults)
+
+        triggers_map = organize_triggers(triggers)
+
+        # ---------------------------------------------
+        # Initialize schema structure
+        # ---------------------------------------------
+
+        schema_data = {}
+
+        for schema in schemas:
+
+            schema_name = schema["schema_name"]
+
+            schema_data[schema_name] = {
+                "tables": {},
+                "views": {}
+            }
+
+        # ---------------------------------------------
+        # Add tables and views
+        # ---------------------------------------------
+
+        for obj in objects:
+
+            schema_name = obj["schema_name"]
+            object_name = obj["object_name"]
+            object_id = obj["object_id"]
+
+            if schema_name not in schema_data:
+                schema_data[schema_name] = {
+                    "tables": {},
+                    "views": {}
                 }
 
-            schema[table_name]["columns"].append({
-                "name": row.column_name,
-                "data_type": row.data_type,
-                "max_length": row.max_length,
-                "precision": row.precision,
-                "scale": row.scale,
-                "nullable": bool(row.is_nullable),
-                "identity": bool(row.is_identity),
-                "primary_key": bool(row.is_primary_key)
-            })
+            is_view = obj["object_type"] == "V"
 
-        # --------------------------------------
-        # 2. RETRIEVE FOREIGN KEY RELATIONSHIPS
-        # --------------------------------------
+            object_data = {
 
-        fk_query = f"""
-            SELECT
-                ps.name AS parent_schema,
-                pt.name AS parent_table,
-                pc.name AS parent_column,
+                "object_id": object_id,
 
-                rs.name AS referenced_schema,
-                rt.name AS referenced_table,
-                rc.name AS referenced_column,
+                "object_type": obj["object_type_desc"],
 
-                fk.name AS foreign_key_name
+                "description": obj["description"],
 
-            FROM sys.foreign_keys fk
+                "estimated_row_count":
+                    obj["estimated_row_count"],
 
-            INNER JOIN sys.foreign_key_columns fkc
-                ON fk.object_id = fkc.constraint_object_id
+                "columns": columns_map.get(
+                    object_id, []
+                ),
 
-            INNER JOIN sys.tables pt
-                ON fkc.parent_object_id = pt.object_id
+                "indexes": indexes_map.get(
+                    object_id, []
+                ),
 
-            INNER JOIN sys.schemas ps
-                ON pt.schema_id = ps.schema_id
+                "primary_key_columns": [],
 
-            INNER JOIN sys.columns pc
-                ON fkc.parent_object_id = pc.object_id
-                AND fkc.parent_column_id = pc.column_id
+                "foreign_keys": [],
 
-            INNER JOIN sys.tables rt
-                ON fkc.referenced_object_id = rt.object_id
+                "check_constraints": [],
 
-            INNER JOIN sys.schemas rs
-                ON rt.schema_id = rs.schema_id
+                "default_constraints": [],
 
-            INNER JOIN sys.columns rc
-                ON fkc.referenced_object_id = rc.object_id
-                AND fkc.referenced_column_id = rc.column_id
+                "triggers": []
+            }
 
-            WHERE ps.name IN ({placeholders})
-              AND rs.name IN ({placeholders})
+            if is_view:
 
-            ORDER BY pt.name, fk.name;
-        """
+                object_data["view_definition"] = (
+                    obj["view_definition"]
+                )
 
-        cursor.execute(
-            fk_query,
-            allowed_schemas + allowed_schemas
+                schema_data[schema_name][
+                    "views"
+                ][object_name] = object_data
+
+            else:
+
+                object_data["foreign_keys"] = [
+                    fk for fk in foreign_keys_list
+                    if fk["schema_name"] == schema_name
+                    and fk["table_name"] == object_name
+                ]
+
+                object_data["check_constraints"] = (
+                    checks_map.get(
+                        (schema_name, object_name), []
+                    )
+                )
+
+                object_data["default_constraints"] = (
+                    defaults_map.get(
+                        (schema_name, object_name), []
+                    )
+                )
+
+                object_data["triggers"] = (
+                    triggers_map.get(
+                        (schema_name, object_name), []
+                    )
+                )
+
+                # Extract primary key columns
+                for index in object_data["indexes"]:
+
+                    if index["is_primary_key"]:
+
+                        object_data[
+                            "primary_key_columns"
+                        ] = [
+                            item["column_name"]
+                            for item in index["key_columns"]
+                        ]
+
+                schema_data[schema_name][
+                    "tables"
+                ][object_name] = object_data
+
+        # ---------------------------------------------
+        # Final JSON structure
+        # ---------------------------------------------
+
+        output = {
+
+            "export_metadata": {
+
+                "exported_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+                "database_name": SQL_DATABASE,
+
+                "exported_by": SQL_USERNAME,
+
+                "export_version": "1.0"
+
+            },
+
+            "database": database_info,
+
+            "schemas": schema_data
+
+        }
+
+        # ---------------------------------------------
+        # Save JSON
+        # ---------------------------------------------
+
+        os.makedirs(
+            os.path.dirname(OUTPUT_FILE),
+            exist_ok=True
         )
 
-        for row in cursor.fetchall():
+        with open(
+            OUTPUT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
 
-            parent = f"{row.parent_schema}.{row.parent_table}"
+            json.dump(
+                output,
+                file,
+                indent=4,
+                ensure_ascii=False,
+                default=str
+            )
 
-            if parent not in schema:
-                continue
+        # ---------------------------------------------
+        # Summary
+        # ---------------------------------------------
 
-            schema[parent]["foreign_keys"].append({
-                "constraint": row.foreign_key_name,
-                "column": row.parent_column,
-                "references": (
-                    f"{row.referenced_schema}."
-                    f"{row.referenced_table}."
-                    f"{row.referenced_column}"
-                )
-            })
+        total_tables = 0
+        total_views = 0
 
-        return schema
+        for schema_name, schema in schema_data.items():
+
+            table_count = len(schema["tables"])
+            view_count = len(schema["views"])
+
+            total_tables += table_count
+            total_views += view_count
+
+            print(
+                f"{schema_name}: "
+                f"{table_count} tables, "
+                f"{view_count} views"
+            )
+
+        print("\n====================================")
+        print("DATABASE SCHEMA EXPORT SUCCESSFUL")
+        print("====================================")
+
+        print(f"Database: {SQL_DATABASE}")
+        print(f"Total schemas: {len(schema_data)}")
+        print(f"Total tables: {total_tables}")
+        print(f"Total views: {total_views}")
+        print(f"Total foreign keys: {len(foreign_keys_list)}")
+        print(f"Output file: {OUTPUT_FILE}")
+
+    except Exception as e:
+
+        print("\nSCHEMA EXPORT FAILED")
+        print(str(e))
+
+        raise
 
     finally:
-        cursor.close()
-        conn.close()
+
+        if connection:
+            connection.close()
 
 
-# --------------------------------------
-# 3. EXPORT SCHEMA AS JSON
-# --------------------------------------
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
-def save_schema_to_file(
-    output_file="/opt/enterprise-chatbot/schema.json"
-):
+if __name__ == "__main__":
 
-    schema = get_database_schema()
+    export_database_schema()
 
-    with open(output_file, "w", encoding="utf-8") as file:
-
-        json.dump(
-            schema,
-            file,
-            indent=4,
-            ensure_ascii=False
-        )
-
-    print(f"Schema saved successfully: {output_file}")
-
-    return schema
 
 
 ```
+
+3. Check your .env file
+Make sure /opt/enterprise-chatbot/.env contains:
+
+```
+
+SQL_SERVER=127.0.0.1
+SQL_PORT=1433
+SQL_DATABASE=Earn
+SQL_USERNAME=llm_reader
+SQL_PASSWORD=YOUR_DATABASE_PASSWORD
+
+ODBC_DRIVER=ODBC Driver 18 for SQL Server
+```
+
+4. Install dependencies and execute
+
+```
+cd /opt/enterprise-chatbot
+
+source venv/bin/activate
+
+pip install pyodbc python-dotenv
+
+python database/export_database_schema.py
+```
+
+5. Verify the exported JSON
+
+ls -lh /opt/enterprise-chatbot/earn_database_schema.json
 
 
 
