@@ -1406,10 +1406,937 @@ python database/export_database_schema.py
 ls -lh /opt/enterprise-chatbot/earn_database_schema.json
 
 
+============================================================ 
+6. Important: How we will use this JSON with Ollama
+
+2. Prepare the project structure
+```
+/opt/enterprise-chatbot/
+│
+├── .env
+├── earn_database_schema.json
+│
+├── database/
+│   └── export_database_schema.py
+│
+├── text_to_sql/
+│   └── text_to_sql.py
+│
+└── venv/
+
+```
+
+3. Install the required Python packages
+pip install pyodbc requests python-dotenv sqlglot
+
+4. Configure the .env file
+nano /opt/enterprise-chatbot/.env
+
+```
+
+SQL_SERVER=127.0.0.1
+SQL_PORT=1433
+SQL_DATABASE=Earn
+SQL_USERNAME=llm_reader
+SQL_PASSWORD=EarnLLM@2026Strong!
+
+ODBC_DRIVER=ODBC Driver 18 for SQL Server
+
+
+# OLLAMA
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=gpt-oss:20b
+
+# TEXT TO SQL
+SCHEMA_FILE=/opt/enterprise-chatbot/earn_database_schema.json
+MAX_SCHEMA_TABLES=8
+MAX_RESULT_ROWS=200
+SQL_QUERY_TIMEOUT=60
+OLLAMA_TIMEOUT=600
+
+# Optional second LLM call to explain SQL results
+EXPLAIN_RESULTS=false
+
+
+```
+
+6. Create the complete Text-to-SQL Python application
+nano /opt/enterprise-chatbot/text_to_sql/text_to_sql.py
+
+```
+import os
+import re
+import json
+import requests
+import pyodbc
+import sqlglot
+
+from dotenv import load_dotenv
+from sqlglot import exp
+from decimal import Decimal
+from datetime import date, datetime
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv("/opt/enterprise-chatbot/.env")
+
+SQL_SERVER = os.getenv("SQL_SERVER", "127.0.0.1")
+SQL_PORT = os.getenv("SQL_PORT", "1433")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "Earn")
+SQL_USERNAME = os.getenv("SQL_USERNAME")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD")
+
+ODBC_DRIVER = os.getenv(
+    "ODBC_DRIVER",
+    "ODBC Driver 18 for SQL Server"
+)
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434"
+).rstrip("/")
+
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+
+SCHEMA_FILE = os.getenv(
+    "SCHEMA_FILE",
+    "/opt/enterprise-chatbot/earn_database_schema.json"
+)
+
+MAX_SCHEMA_TABLES = int(os.getenv("MAX_SCHEMA_TABLES", "8"))
+MAX_RESULT_ROWS = int(os.getenv("MAX_RESULT_ROWS", "200"))
+SQL_QUERY_TIMEOUT = int(os.getenv("SQL_QUERY_TIMEOUT", "60"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+
+EXPLAIN_RESULTS = (
+    os.getenv("EXPLAIN_RESULTS", "false").lower() == "true"
+)
+
+
+# ============================================================
+# LOAD DATABASE SCHEMA JSON
+# ============================================================
+
+def load_database_schema():
+
+    if not os.path.exists(SCHEMA_FILE):
+        raise FileNotFoundError(
+            f"Schema JSON not found: {SCHEMA_FILE}"
+        )
+
+    with open(SCHEMA_FILE, "r", encoding="utf-8") as file:
+        schema = json.load(file)
+
+    if "schemas" not in schema:
+        raise ValueError(
+            "Invalid schema JSON: 'schemas' property missing"
+        )
+
+    return schema
+
+
+# ============================================================
+# BUILD TABLE AND VIEW CATALOG
+# ============================================================
+
+def build_object_catalog(schema_json):
+
+    catalog = {}
+
+    for schema_name, schema_data in schema_json["schemas"].items():
+
+        for object_type in ("tables", "views"):
+
+            for object_name, object_data in schema_data.get(
+                object_type, {}
+            ).items():
+
+                key = (schema_name.lower(), object_name.lower())
+
+                catalog[key] = {
+                    "schema_name": schema_name,
+                    "object_name": object_name,
+                    "object_type": object_type,
+                    "object_data": object_data
+                }
+
+    return catalog
+
+
+# ============================================================
+# SELECT RELEVANT TABLES
+# ============================================================
+
+STOP_WORDS = {
+    "the", "is", "are", "was", "were", "how", "many",
+    "what", "which", "who", "where", "when", "show",
+    "give", "me", "list", "all", "total", "count",
+    "number", "of", "in", "on", "at", "from", "to",
+    "and", "or", "with", "for", "by", "a", "an",
+    "registered", "registration", "please", "find"
+}
+
+
+def tokenize(text):
+
+    words = re.findall(r"[a-zA-Z0-9_]+", text.lower())
+
+    return {
+        word for word in words
+        if len(word) > 1 and word not in STOP_WORDS
+    }
+
+
+def get_object_search_text(item):
+
+    data = item["object_data"]
+
+    parts = [
+        item["schema_name"],
+        item["object_name"],
+        item["object_type"]
+    ]
+
+    if data.get("description"):
+        parts.append(str(data["description"]))
+
+    for column in data.get("columns", []):
+
+        parts.append(str(column.get("column_name", "")))
+        parts.append(str(column.get("data_type", "")))
+
+        if column.get("description"):
+            parts.append(str(column["description"]))
+
+    return " ".join(parts).lower()
+
+
+def select_relevant_objects(question, catalog):
+
+    question_tokens = tokenize(question)
+
+    scores = []
+
+    for key, item in catalog.items():
+
+        search_text = get_object_search_text(item)
+        object_tokens = tokenize(search_text)
+
+        score = len(question_tokens.intersection(object_tokens))
+
+        # Boost exact table-name matches.
+        table_name = item["object_name"].lower()
+
+        if table_name in question.lower():
+            score += 5
+
+        # Boost schema-name matches.
+        schema_name = item["schema_name"].lower()
+
+        if schema_name in question.lower():
+            score += 2
+
+        scores.append((score, key, item))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+
+    selected = [
+        item for score, key, item in scores
+        if score > 0
+    ][:MAX_SCHEMA_TABLES]
+
+    # If no useful keyword match, provide a small fallback set.
+    if not selected:
+        selected = [
+            item for score, key, item in scores[:MAX_SCHEMA_TABLES]
+        ]
+
+    # Add one-hop FK-related objects to improve join awareness.
+    selected_keys = {
+        (item["schema_name"].lower(), item["object_name"].lower())
+        for item in selected
+    }
+
+    related_items = []
+
+    for item in list(selected):
+
+        for fk in item["object_data"].get("foreign_keys", []):
+
+            related_key = (
+                fk["referenced_schema_name"].lower(),
+                fk["referenced_table_name"].lower()
+            )
+
+            if related_key in catalog and related_key not in selected_keys:
+
+                related_items.append(catalog[related_key])
+                selected_keys.add(related_key)
+
+    remaining_slots = max(
+        0, MAX_SCHEMA_TABLES - len(selected)
+    )
+
+    selected.extend(related_items[:remaining_slots])
+
+    return selected
+
+
+# ============================================================
+# CREATE COMPACT SCHEMA CONTEXT FOR OLLAMA
+# ============================================================
+
+def build_schema_context(selected_objects):
+
+    context = []
+
+    for item in selected_objects:
+
+        data = item["object_data"]
+
+        object_info = {
+            "schema": item["schema_name"],
+            "name": item["object_name"],
+            "type": item["object_type"],
+            "columns": [],
+            "primary_key_columns": data.get(
+                "primary_key_columns", []
+            ),
+            "foreign_keys": []
+        }
+
+        for column in data.get("columns", []):
+
+            object_info["columns"].append({
+
+                "name": column["column_name"],
+                "type": column["data_type"],
+                "nullable": column["is_nullable"],
+                "identity": column["is_identity"],
+                "description": column.get("description")
+
+            })
+
+        for fk in data.get("foreign_keys", []):
+
+            object_info["foreign_keys"].append({
+
+                "name": fk["foreign_key_name"],
+
+                "columns": fk["column_mappings"],
+
+                "references": (
+                    f'{fk["referenced_schema_name"]}.'
+                    f'{fk["referenced_table_name"]}'
+                )
+
+            })
+
+        context.append(object_info)
+
+    return json.dumps(
+        context,
+        ensure_ascii=False,
+        indent=2
+    )
+
+
+# ============================================================
+# OLLAMA: GENERATE SQL
+# ============================================================
+
+def generate_sql(question, schema_context):
+
+    system_prompt = """
+You are an expert Microsoft SQL Server T-SQL developer.
+
+Your task is to generate a SQL query using ONLY the
+database schema supplied by the application.
+
+STRICT RULES:
+
+1. Generate exactly one read-only SELECT statement.
+2. Never generate INSERT, UPDATE, DELETE, DROP, ALTER,
+   CREATE, TRUNCATE, EXEC, or stored procedure calls.
+3. Do not generate multiple SQL statements.
+4. Use only the supplied tables and views.
+5. Always use schema-qualified table names.
+   Example: [ben].[Neet]
+6. Use only columns that exist in the supplied schema.
+7. Use the supplied foreign keys when joining tables.
+8. Do not invent columns, tables, relationships or values.
+9. For count questions, use COUNT_BIG(*) or COUNT(*)
+   as appropriate.
+10. For a list or detail question, return useful columns,
+    not SELECT *.
+11. Use valid Microsoft SQL Server T-SQL syntax.
+12. Do not include Markdown code fences.
+
+Return ONLY a valid JSON object with this structure:
+
+{
+  "sql": "SELECT ...",
+  "explanation": "Brief explanation of the query"
+}
+
+If the supplied schema is insufficient to answer the question,
+return:
+
+{
+  "sql": "",
+  "explanation": "The supplied database schema is insufficient..."
+}
+"""
+
+    user_prompt = f"""
+DATABASE SCHEMA:
+
+{schema_context}
+
+USER QUESTION:
+
+{question}
+
+Generate the SQL Server query.
+"""
+
+    payload = {
+
+        "model": OLLAMA_MODEL,
+
+        "stream": False,
+
+        "format": "json",
+
+        "options": {
+            "temperature": 0,
+            "num_predict": 400
+        },
+
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ]
+    }
+
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        timeout=OLLAMA_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    content = result["message"]["content"]
+
+    try:
+        generated = json.loads(content)
+
+    except json.JSONDecodeError:
+        raise ValueError(
+            "Ollama did not return valid JSON:\n" + content
+        )
+
+    sql = generated.get("sql", "").strip()
+    explanation = generated.get("explanation", "")
+
+    if not sql:
+        raise ValueError(
+            explanation or "Ollama could not generate SQL."
+        )
+
+    return sql, explanation
+
+
+# ============================================================
+# REMOVE MARKDOWN FENCES
+# ============================================================
+
+def clean_sql(sql):
+
+    sql = sql.strip()
+
+    sql = re.sub(
+        r"^```(?:sql)?\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    sql = re.sub(
+        r"\s*```$",
+        "",
+        sql
+    )
+
+    return sql.strip()
+
+
+# ============================================================
+# VALIDATE SQL
+# ============================================================
+
+def validate_sql(sql, catalog):
+
+    sql = clean_sql(sql)
+
+    # Reject SQL comments and suspicious batch separators.
+    if "--" in sql or "/*" in sql or "*/" in sql:
+        raise ValueError(
+            "SQL comments are not allowed."
+        )
+
+    if re.search(r"(?im)^\s*GO\s*$", sql):
+        raise ValueError(
+            "SQL batch separators are not allowed."
+        )
+
+    # Parse exactly one T-SQL statement.
+    statements = sqlglot.parse(
+        sql,
+        read="tsql"
+    )
+
+    if len(statements) != 1 or statements[0] is None:
+        raise ValueError(
+            "Only one SQL statement is allowed."
+        )
+
+    tree = statements[0]
+
+    # Only SELECT queries are accepted.
+    if not isinstance(tree, exp.Select):
+        raise ValueError(
+            "Only SELECT queries are allowed."
+        )
+
+    # Explicitly reject unsafe constructs.
+    forbidden_nodes = (
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Create,
+        exp.Drop,
+        exp.Alter,
+        exp.Command,
+        exp.Into
+    )
+
+    for node in tree.walk():
+
+        if isinstance(node, forbidden_nodes):
+            raise ValueError(
+                f"Unsafe SQL operation detected: {type(node).__name__}"
+            )
+
+    # Identify CTE aliases, so references to CTEs
+    # are not mistaken for physical database tables.
+    cte_names = {
+        cte.alias_or_name.lower()
+        for cte in tree.find_all(exp.CTE)
+    }
+
+    # Validate physical table/view references.
+    allowed_objects = set(catalog.keys())
+
+    for table in tree.find_all(exp.Table):
+
+        table_name = table.name.lower()
+        schema_name = (table.db or "").lower()
+
+        # CTE references are not physical tables.
+        if not schema_name and table_name in cte_names:
+            continue
+
+        if not schema_name:
+            raise ValueError(
+                f"Schema qualification required for table: {table_name}"
+            )
+
+        key = (schema_name, table_name)
+
+        if key not in allowed_objects:
+            raise ValueError(
+                "Table/view not found in exported schema: "
+                f"{schema_name}.{table_name}"
+            )
+
+    # Use SQL Server syntax when returning the validated query.
+    return tree.sql(dialect="tsql")
+
+
+# ============================================================
+# SQL SERVER CONNECTION
+# ============================================================
+
+def get_sql_connection():
+
+    if not SQL_USERNAME or not SQL_PASSWORD:
+        raise ValueError(
+            "SQL_USERNAME or SQL_PASSWORD is missing in .env"
+        )
+
+    connection_string = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={SQL_SERVER},{SQL_PORT};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
+        "Connection Timeout=30;"
+    )
+
+    return pyodbc.connect(
+        connection_string,
+        autocommit=True,
+        timeout=30
+    )
+
+
+# ============================================================
+# CONVERT SQL VALUES TO JSON-SAFE VALUES
+# ============================================================
+
+def make_json_safe(value):
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, bytes):
+        return value.hex()
+
+    return value
+
+
+# ============================================================
+# EXECUTE SQL QUERY
+# ============================================================
+
+def execute_sql(sql):
+
+    connection = None
+
+    try:
+
+        connection = get_sql_connection()
+
+        cursor = connection.cursor()
+
+        cursor.timeout = SQL_QUERY_TIMEOUT
+
+        # Limit the number of returned rows.
+        cursor.execute(
+            f"SET ROWCOUNT {MAX_RESULT_ROWS};"
+        )
+
+        cursor.execute(
+            "SET LOCK_TIMEOUT 5000;"
+        )
+
+        print("\nExecuting SQL against SQL Server...")
+
+        cursor.execute(sql)
+
+        if cursor.description is None:
+            raise ValueError(
+                "The SQL statement did not return a result set."
+            )
+
+        columns = [
+            column[0]
+            for column in cursor.description
+        ]
+
+        rows = []
+
+        for row in cursor.fetchall():
+
+            rows.append({
+                columns[i]: make_json_safe(value)
+                for i, value in enumerate(row)
+            })
+
+        cursor.execute("SET ROWCOUNT 0;")
+
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "max_rows": MAX_RESULT_ROWS
+        }
+
+    finally:
+
+        if connection:
+            connection.close()
+
+
+# ============================================================
+# OPTIONAL: OLLAMA EXPLAINS THE DATABASE RESULTS
+# ============================================================
+
+def explain_results(question, sql, result):
+
+    prompt = f"""
+The user asked:
+
+{question}
+
+SQL executed:
+
+{sql}
+
+SQL Server returned:
+
+{json.dumps(result, ensure_ascii=False, default=str)}
+
+Explain the result clearly and accurately.
+
+Rules:
+- Use only the returned data.
+- Do not invent additional statistics.
+- If no records were returned, say so.
+- If the result is truncated, mention the limit.
+- Keep the answer concise.
+"""
+
+    payload = {
+
+        "model": OLLAMA_MODEL,
+
+        "stream": False,
+
+        "options": {
+            "temperature": 0,
+            "num_predict": 250
+        },
+
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        timeout=OLLAMA_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    return response.json()["message"]["content"]
+
+
+# ============================================================
+# MAIN TEXT-TO-SQL WORKFLOW
+# ============================================================
+
+def ask_database(question):
+
+    print("\n========================================")
+    print("EARN DATABASE - TEXT TO SQL")
+    print("========================================")
+
+    # 1. Load schema.
+    print("\n[1] Loading database schema...")
+
+    schema_json = load_database_schema()
+
+    # 2. Build table catalog.
+    print("[2] Building table catalog...")
+
+    catalog = build_object_catalog(schema_json)
+
+    print(f"    Available objects: {len(catalog)}")
+
+    # 3. Select relevant tables.
+    print("[3] Selecting relevant tables...")
+
+    selected_objects = select_relevant_objects(
+        question,
+        catalog
+    )
+
+    print(
+        "    Selected:",
+        [
+            f'{x["schema_name"]}.{x["object_name"]}'
+            for x in selected_objects
+        ]
+    )
+
+    if not selected_objects:
+        raise ValueError(
+            "No relevant tables or views were found."
+        )
+
+    # 4. Build compact schema context.
+    print("[4] Preparing schema context...")
+
+    schema_context = build_schema_context(
+        selected_objects
+    )
+
+    # 5. Ask Ollama to generate SQL.
+    print("[5] Sending question to Ollama...")
+
+    generated_sql, sql_explanation = generate_sql(
+        question,
+        schema_context
+    )
+
+    print("\nGenerated SQL:")
+    print("----------------------------------------")
+    print(generated_sql)
+    print("----------------------------------------")
+
+    print("\nSQL explanation:")
+    print(sql_explanation)
+
+    # 6. Validate SQL.
+    print("\n[6] Validating SQL...")
+
+    validated_sql = validate_sql(
+        generated_sql,
+        catalog
+    )
+
+    # 7. Execute against SQL Server.
+    print("[7] Executing validated SQL...")
+
+    result = execute_sql(validated_sql)
+
+    # 8. Display results.
+    print("\n========================================")
+    print("SQL SERVER RESULTS")
+    print("========================================")
+
+    print(f"Returned rows: {result['row_count']}")
+
+    if result["row_count"] == 0:
+        print("\nNo records found.")
+
+    else:
+
+        print("\nColumns:")
+        print(" | ".join(result["columns"]))
+
+        print("\nRecords:")
+
+        for index, row in enumerate(result["rows"], start=1):
+
+            print(f"\nRecord {index}")
+
+            for column, value in row.items():
+                print(f"  {column}: {value}")
+
+    # 9. Optional natural-language explanation.
+    if EXPLAIN_RESULTS:
+
+        print("\n[8] Asking Ollama to explain the results...")
+
+        answer = explain_results(
+            question,
+            validated_sql,
+            result
+        )
+
+        print("\n========================================")
+        print("NATURAL LANGUAGE ANSWER")
+        print("========================================")
+
+        print(answer)
+
+    if result["row_count"] >= MAX_RESULT_ROWS:
+
+        print(
+            "\nNote: The result may be limited to "
+            f"{MAX_RESULT_ROWS} rows."
+        )
+
+    return {
+        "question": question,
+        "sql": validated_sql,
+        "sql_explanation": sql_explanation,
+        "result": result
+    }
+
+
+# ============================================================
+# INTERACTIVE TERMINAL
+# ============================================================
+
+def main():
+
+    print("\nEARN DATABASE CHAT")
+    print("Type 'exit' to quit.")
+
+    while True:
+
+        question = input(
+            "\nAsk your database: "
+        ).strip()
+
+        if question.lower() in ("exit", "quit"):
+            print("Goodbye!")
+            break
+
+        if not question:
+            continue
+
+        try:
+
+            ask_database(question)
+
+        except requests.exceptions.ConnectionError:
+
+            print(
+                "\nERROR: Cannot connect to Ollama. "
+                "Check that Ollama is running."
+            )
+
+        except requests.exceptions.Timeout:
+
+            print(
+                "\nERROR: Ollama request timed out. "
+                "Check model performance and OLLAMA_TIMEOUT."
+            )
+
+        except pyodbc.Error as e:
+
+            print("\nSQL SERVER ERROR:")
+            print(str(e))
+
+        except Exception as e:
+
+            print("\nAPPLICATION ERROR:")
+            print(str(e))
+
+
+if __name__ == "__main__":
+    main()
 
 
 
-
+```
 
 
 
