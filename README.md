@@ -2027,23 +2027,25 @@ def make_json_safe(value):
 # EXECUTE SQL QUERY
 # ============================================================
 
+
 def execute_sql(sql):
 
     connection = None
 
     try:
-
         connection = get_sql_connection()
+
+        # Set query execution timeout on the connection.
+        connection.timeout = SQL_QUERY_TIMEOUT
 
         cursor = connection.cursor()
 
-        cursor.timeout = SQL_QUERY_TIMEOUT
-
-        # Limit the number of returned rows.
+        # Limit returned rows.
         cursor.execute(
             f"SET ROWCOUNT {MAX_RESULT_ROWS};"
         )
 
+        # Avoid waiting indefinitely for locked records.
         cursor.execute(
             "SET LOCK_TIMEOUT 5000;"
         )
@@ -2070,8 +2072,6 @@ def execute_sql(sql):
                 columns[i]: make_json_safe(value)
                 for i, value in enumerate(row)
             })
-
-        cursor.execute("SET ROWCOUNT 0;")
 
         return {
             "columns": columns,
@@ -2333,8 +2333,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 ```
 
